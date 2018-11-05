@@ -1,0 +1,225 @@
+##################################################
+
+## TPS Data Scientist Application Project
+## Christopher Salahub
+
+##################################################
+
+## Packages ######################################
+library(MASS)
+library(ggplot2)
+library(stringr)
+library(rgl)
+
+## Constants #####################################
+## data locations
+trafCamURL <- "http://opendata.toronto.ca/transportation/tmc/rescucameraimages/Data/tmcearthcameras.csv"
+accidentData <- "KSI.csv"
+traffVol <- "8hrVeh&PedVolume_6-Mar-2018.csv"
+
+## colour palette from colorbrewer
+pal <- c("#e66101", "#fdb863", "#b2abd2", "#5e3c99")
+
+StationIDCentre
+
+## http://climate.weather.gc.ca/climate_data/bulk_data_e.html?format=csv&stationID=1706&Year=${year}&Month=${month}&Day=14&timeframe=1&submit= Download+Data
+
+
+## Functions #####################################
+## make a small UNIX day helper
+UNIXday <- function(numdate) floor(as.numeric(numdate)/86400)
+
+## a small hour and minute of day helper
+hour <- function(numdate) as.numeric(format(numdate, "%H"))
+minute <- function(numdate) as.numeric(format(numdate, "%M"))
+
+## make a function to explore bandwidth choices
+tryBandwidth <- function(bw, p3d = FALSE, plotboth = FALSE, ..., contour_options) {
+    AccDens <- kde2d(x = Accidents$longitude, y = Accidents$latitude,
+                     h = bw, n = 100)
+    if (plotboth) {
+        TraceDens <- kde2d(x = Filt_Traces$longitude,
+                           y = Filt_Traces$latitude,
+                           h = bw, n = 100)
+    }
+    if (p3d) {
+        persp(AccDens, col = adjustcolor('firebrick',alpha.f=0.3), theta = 10, phi = 25, ...)
+        if (plotboth) {
+            dev.new()
+            persp(TraceDens, col = 'steelblue', theta = 10, phi = 25, ...)
+        }
+    } else {
+        plot(Accidents$longitude, Accidents$latitude, ...)
+        if (missing(contour_options)) {
+            contour(AccDens, add = TRUE)
+        } else {
+            do.call(contour, c(list(x = AccDens$x, y = AccDens$y, z = AccDens$z, add = TRUE), contour_options))
+        }
+        if (plotboth) {
+            dev.new()
+            plot(Filt_Traces$longitude, Filt_Traces$latitude, pch = ".", ...)
+            if (missing(contour_options)) {
+                contour(AccDens, add = TRUE)
+            } else {
+                do.call(contour, c(list(x = AccDens$x, y = AccDens$y, z = AccDens$z, add = TRUE), contour_options))
+            }
+        }
+    }
+}
+
+## create a function to explore and compare multiple contours
+MultiContour <- function(Data = AccType, Dens = AccTypeDens, which = 1:9, sidebyside = FALSE) {
+    stopifnot(length(which) <= length(Data) & length(Data) == length(Dens))
+    pal <- rainbow(length(Data))
+    if (!sidebyside) plot(NA, xlim = rangelims[1:2], ylim = rangelims[3:4])
+    for (ii in which) {
+        if (sidebyside) {
+            dev.new()
+            plot(Data[[ii]]$longitude, Data[[ii]]$latitude, pch = 20, col = adjustcolor(1, alpha.f = 0.3),
+                  xlim = rangelims[1:2], ylim = rangelims[3:4], main = names(Data)[ii])
+        } else {
+            points(Data[[ii]]$longitude, Data[[ii]]$latitude, pch = 20, col = adjustcolor(1, alpha.f = 0.3))
+        }
+        contour(Dens[[ii]], nlevels = 15, col = adjustcolor(1, alpha.f = 0.3), add = TRUE)
+        readline("Press ENTER to see the next plot")
+    }
+}
+
+## create a functiont to filter an output density
+FilterDens <- function(density, xlow = x_min, xhigh = x_max,
+                       ylow = y_min, yhigh = y_max) {
+    x <- density$x
+    y <- density$y
+    z <- density$z
+    Xind <- x <= xhigh & x >= xlow
+    Yind <- y <= yhigh & y >= ylow
+    newDens <- list(x = x[Xind], y = y[Yind],
+                    z = z[Xind, Yind])
+    return(newDens)
+}
+
+## create a function to generate a recombined density given a set of weights
+GenerateRecom <- function(Wgts, sizes = NULL) {
+    if (is.null(sizes)) {Sizes <- sapply(Data[3:5],
+                                         function(dat) nrow(windowFilter(dat))/nrow(windowFilter(Data[[1]])))
+        } else Sizes <- sizes
+    RecomWgts <- Sizes*Wgts
+    RecomWgts <- RecomWgts/sum(RecomWgts)
+    RecomDens <- list(x = FiltDens$Accidents$x, y = FiltDens$Accidents$y,
+                      z = FiltDens$Deaths$z*RecomWgts[1] + FiltDens$SeriousInjury$z*RecomWgts[2] +
+                          FiltDens$LightInjury$z*RecomWgts[3])
+    RecomRisk <- list(x = RecomDens$x, y = RecomDens$y,
+                      z = RecomDens$z/FiltDens$Filt_Traces$z)
+    RecomRisk
+}
+
+## make a function for comparing two densities in 3D
+Compare3D <- function(dens1, dens2){
+    mfrow3d(1,2,sharedMouse = TRUE)
+    persp3d(dens1, col = "firebrick")
+    next3d()
+    persp3d(dens2, col = "steelblue")
+}
+
+## make a function to output the road risk data
+RiskOut <- function(filename = "risk.csv", risk = RecomRisk) {
+    longvals <- rep(risk$x, times = length(risk$y))
+    latvals <- rep(risk$y, each = length(risk$x))
+    riskvals <- c(risk$z)
+    outdat <- data.frame(longitude = longvals, latitude = latvals, risk = riskvals)
+    write.csv(outdat, filename, row.names = FALSE)
+}
+
+## write a custom function to iterate over coordinates and extract a risk
+RoadMaps <- function(nodes, density = RecomRisk, scaleDens = FALSE){
+    xVals <- density$x
+    yVals <- density$y
+    DensVals <- density$z
+    xlength <- length(xVals)
+    ylength <- length(yVals)
+    yRes <- diff(yVals)[1]
+    xRes <- diff(xVals)[1]
+    if (scaleDens) {
+        area <- xRes*yRes
+        DensVals <- DensVals/(sum(DensVals*area))
+    }
+    RefDist <- sqrt(xRes^2 + yRes^2)
+    RoadIterator <- function(el) {
+        xPos <- sum(RecomRisk$x < el[3])
+        yPos <- sum(RecomRisk$y < el[2])
+        xRng <- (ifelse(xPos == 0, xPos + 1, xPos)):(ifelse(xPos == xlength, xPos, (xPos+1)))
+        yRng <- (ifelse(yPos == 0, yPos + 1, yPos)):(ifelse(yPos == ylength, yPos, (yPos+1)))
+        adjX <- xVals[xRng] - el[3]
+        adjY <- yVals[yRng] - el[2]
+        dists <- RefDist - (sqrt(rep(adjX^2, times = length(yRng)) +
+                                 rep(adjY^2, each = length(xRng))))
+        dists <- dists/sum(dists)
+        densEst <- sum(dists*c(DensVals[xRng,yRng]))
+        densEst
+    }
+    NodeVals <- lapply(nodes, RoadIterator)
+    NodeValsFinal <- NodeVals[which(unlist(lapply(NodeVals, function(el) el > 0)))]
+    NodesFinal <- nodes[which(unlist(lapply(NodeVals, function(el) el > 0)))]
+    NodeRisk <- lapply(1:length(NodeValsFinal),
+                       function(ind) c(NodesFinal[[ind]], NodeValsFinal[[ind]]))
+}
+
+## write a function to plot the risk at nodes
+PlotRoadPoints <- function(NodesAndVal, output = TRUE, colrange = NULL){
+    RoadNodePlt <- list()
+    RoadNodePlt$x <- unlist(lapply(NodesAndVal, function(el) el[3]))
+    RoadNodePlt$y <- unlist(lapply(NodesAndVal, function(el) el[2]))
+    RoadNodePlt$z <- unlist(lapply(NodesAndVal, function(el) el[5]))
+    scaleLev <- sqrt(abs(RoadNodePlt$z/max(RoadNodePlt$z)))*sign(RoadNodePlt$z)
+    scaleLev <- (scaleLev - min(scaleLev))/(max(scaleLev) - min(scaleLev))
+    if (is.null(colrange)) {
+        colvals <- rgb(scaleLev,0.2,1-scaleLev)
+    } else {
+        rgbpal <- col2rgb(colrange)
+        palrng <- diff(t(rgbpal))
+        colvals <- rgb(t(rgbpal[,1] + t(scaleLev %*% palrng)), maxColorValue = 255)
+    }
+    plot(RoadNodePlt, col = colvals, pch = 20)
+    if (output) {
+        RoadNodePlt$scale <- scaleLev
+        return(RoadNodePlt)
+    }
+}
+
+
+## Script ########################################
+## start with some basic cleaning/variable synthesis
+## load the data
+ksi <- read.csv(accidentData)
+## clean it up a bit
+names(ksi)[1] <- "X"
+## make the time variable more informative
+ksi$PadTime <- sapply(ksi$TIME,
+                           function(el) paste0(paste0(rep(0, times = 4 - nchar(el)), collapse = ""), el))
+## there is no date/time variable, create one
+ksi$Date <- substr(ksi$DATE, 0, 10)
+ksi$DateTime <- as.POSIXct(x = paste(ksi$Date, ksi$PadTime, sep = " "),
+                           tz = "EST", format = "%Y-%m-%d %H%M")
+## extract the unique dates
+length(ksi.unqDays <- sort(unique(as.POSIXct(ksi$Date, format = "%Y-%m-%d", tz = "EST"))))
+## so we have 12557 accidents over 2641 days, an average of roughly 5 accidents per day
+
+## start with some investigative plotting
+## look spatially
+plot(x = ksi$X, y = ksi$Y, pch = 20)
+## not super informative without a map, but there are some obvious patterns (i.e. streets appear quite clearly in this plot)
+
+## now look at some temporal variables
+plot(y = sort(ksi$YEAR), x = ppoints(length(ksi$YEAR)))
+## some years seem to have more reported accidents than others
+
+## do some more simple time plotting
+plot(x = ksi$DateTime, y = 60*hour(ksi$DateTime) + minute(ksi$DateTime), xlab = "Date",
+     ylab = "Time of Day", yaxt = 'n')
+axis(side = 1, seq(
+
+
+## create distance matrix between points
+ksi.dist <- dist(ksi[,c("X","Y")])
+## take the median as the reasonable bandwidth distance estimate
+ksi.bandwidth <- median(ksi.dist)
