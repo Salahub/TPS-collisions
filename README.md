@@ -2,5 +2,4 @@
 
 ## Christopher Salahub
 
-Completed as part of the application process for a position at TPS
-using public data sources.
+A weekend project on publicly available Toronto Police Service data.
